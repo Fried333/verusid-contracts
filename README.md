@@ -3,40 +3,26 @@
 
 ### Overview
 
-A Verus Contract is a VerusID whose `contentMultiMap` declares a contract type and its parameters. The protocol interprets these declarations through existing CC eval infrastructure — no virtual machine, no bytecode, no Turing completeness. Each contract type is a known template with a precheck validator and an import-time executor, following the same architecture as reserve transfers and basket conversions.
+A Verus Contract is a VerusID whose `contentMultiMap` declares a contract type and its parameters. The protocol interprets these declarations through the Verus Smart Transaction infrastructure — no virtual machine, no bytecode, no Turing completeness. Each contract type is a known template with a precheck validator and an import-time executor, following the same architecture as reserve transfers and basket conversions.
 
 ---
 
 ## Part 1: Code Changes Required
 
-### 1.1 New Eval Code
+### 1.1 Architecture: VDXF-Based, Not Eval-Based
 
-**File: `src/cc/eval.h`** — Add one new eval code after the existing ones:
+> **Important:** Contracts do NOT use a new eval code. Eval codes (`EVAL_RESERVE_TRANSFER`, `EVAL_IDENTITY_PRIMARY`, etc.) are deep protocol primitives — the wrong layer for contracts. Contracts are a higher-level concept built ON existing smart transaction types using VDXF keys.
 
-```cpp
-// Current last entry is EVAL_QUANTUM_KEY = 0x1a
-EVAL(EVAL_CONTRACT_SPEND, 0x1b)    // spending from a contract-bound identity
-```
+A contract identity is just a normal VerusID whose `contentMultiMap` contains a `vrsc::contract.type` VDXF key. Funds sent to it sit in normal identity outputs (`EVAL_IDENTITY_PRIMARY`). The existing smart transaction infrastructure (precheck, validation, import processing) is extended to recognize contract identities by their VDXF keys and dispatch to template-specific logic.
 
-This eval code is used on UTXOs held by a contract identity. When a UTXO is sent to an identity that has `vrsc::contract.type` in its multimap, the output is created with `EVAL_CONTRACT_SPEND` instead of normal `EVAL_IDENTITY_PRIMARY`. This makes the funds spendable only through contract rules, not by the identity's primary key holders directly.
+**What this means for the code:**
+- No new entry in `src/cc/eval.h`
+- No new registration in `src/cc/CCcustom.cpp`
+- No new address/pubkey/WIF triplet
+- Contract dispatch is added to the EXISTING precheck and import processing paths
+- Contract types and actions are defined entirely as VDXF keys
 
-### 1.2 CC Registration
-
-**File: `src/cc/CCcustom.cpp`** — Register in the switch statement alongside existing eval codes:
-
-```cpp
-case EVAL_CONTRACT_SPEND:
-    strcpy(cp->unspendableCCaddr, ContractSpendAddr.c_str());
-    strcpy(cp->normaladdr, ContractSpendAddr.c_str());
-    strcpy(cp->CChexstr, ContractSpendPubKey.c_str());
-    memcpy(cp->CCpriv, DecodeSecret(ContractSpendWIF).begin(), 32);
-    cp->validate = ValidateContractSpend;
-    cp->ismyvin = IsContractSpendInput;
-    cp->contextualprecheck = PrecheckContractSpend;
-    break;
-```
-
-Requires generating a new CC address/pubkey/WIF triplet, same as the existing ones in `CCaddresses.cpp`.
+> **Note on source naming:** The source code still uses legacy Komodo naming (`cc/`, `CCcustom.cpp`, `COptCCParams`, etc.) from the crypto-conditions era. Verus Smart Transactions are architecturally different — they use a verified precheck system that goes far beyond form validation, rejecting anything clearly recognizable as unable to succeed. File paths below reflect the current source layout, not the architecture.
 
 ### 1.3 New Contract Data Structure
 
@@ -59,6 +45,7 @@ public:
         CONTRACT_VESTING = 3,
         CONTRACT_SUBSCRIPTION = 4,
         CONTRACT_CONDITIONAL = 5,
+        CONTRACT_LENDING = 6,
     };
 
     // VDXF key names for contract namespace
@@ -315,114 +302,84 @@ public:
 };
 ```
 
-The state UTXO uses `EVAL_CONTRACT_SPEND` and is held at the contract identity's address. On each state transition, the import processor spends the old state UTXO and creates a new one with updated values. This is exactly how notarizations work — each new notarization spends the previous one.
+The state UTXO is held at the contract identity's address under the identity's existing smart transaction type. On each state transition, the import processor spends the old state UTXO and creates a new one with updated values. This is exactly how notarizations work — each new notarization spends the previous one. Contract identity recognition happens via VDXF key lookup, not a dedicated eval code.
 
-### 1.6 Precheck Function
+### 1.6 Precheck — Extend Existing PrecheckReserveTransfer
 
-**File: `src/pbaas/contracts.cpp`** (new file)
+**File: `src/pbaas/pbaas.cpp`** — The contract precheck logic is added INSIDE the existing `PrecheckReserveTransfer()` function (line 4894), not as a separate precheck function. When a reserve transfer targets an identity with `vrsc::contract.type` in its multimap, the precheck dispatches to template-specific validation.
+
+**File: `src/pbaas/contracts.cpp`** (new file) — Contains the template-specific precheck functions called from `PrecheckReserveTransfer`:
 
 ```cpp
 #include "contracts.h"
 #include "pbaas.h"
 
-// Called by CC infrastructure when a EVAL_CONTRACT_SPEND output is being spent
-bool PrecheckContractSpend(const CTransaction &tx, int32_t outNum,
-                           CValidationState &state, uint32_t height)
+// Called from PrecheckReserveTransfer when destination is a contract identity
+bool PrecheckContractTransfer(const CReserveTransfer &rt,
+                              const CIdentity &contractIdentity,
+                              CValidationState &state, uint32_t height)
 {
-    // 1. Decode the spending transaction — find the import or action
-    COptCCParams p;
-    if (!tx.vout[outNum].scriptPubKey.IsPayToCryptoCondition(p) || !p.IsValid())
-        return state.Error("Invalid contract spend output");
-
-    // 2. Find which identity this contract belongs to
-    //    The output address tells us the contract identity
-    CTxDestination dest;
-    if (!ExtractDestination(tx.vout[outNum].scriptPubKey, dest))
-        return state.Error("Cannot extract contract identity from output");
-
-    CIdentityID contractID = GetDestinationID(dest);
-
-    // 3. Look up the identity and read contract type
-    CIdentity contractIdentity;
-    // Use ConnectedChains or view to get the identity
-    if (!GetIdentity(contractID, contractIdentity, height))
-        return state.Error("Contract identity not found");
-
     if (contractIdentity.IsRevoked())
-        return state.Error("Contract identity is revoked — contract paused");
+        return state.Error("Cannot send to revoked contract identity — contract paused");
 
     CVerusContract::EContractType cType = CVerusContract::GetContractType(contractIdentity);
-    if (cType == CVerusContract::CONTRACT_INVALID)
-        return state.Error("Identity is not a contract");
 
-    // 4. Dispatch to type-specific precheck
+    // Extract action VDXF key from auxDests (if present)
+    uint160 actionKey;
+    if (rt.destination.AuxDestCount() > 0)
+    {
+        CTransferDestination auxDest;
+        rt.destination.GetAuxDest(auxDest, 0);
+        if (auxDest.TypeNoFlags() == CTransferDestination::DEST_ID)
+            actionKey = CIdentityID(auxDest.destination);
+    }
+
     switch (cType)
     {
         case CVerusContract::CONTRACT_SPLITTER:
-        {
-            CContractSplitter splitter = CContractSplitter::FromIdentity(contractIdentity);
-            if (!splitter.IsValid())
-                return state.Error("Invalid splitter contract parameters");
-            // Splitter has no actions — funds are auto-split on deposit
-            // Precheck: verify the spending tx is an import transaction
-            return PrecheckSplitterSpend(tx, outNum, state, height, splitter);
-        }
+            // Splitter accepts any transfer — no action needed
+            return true;
 
         case CVerusContract::CONTRACT_ESCROW:
         {
             CContractEscrow escrow = CContractEscrow::FromIdentity(contractIdentity);
             if (!escrow.IsValid())
                 return state.Error("Invalid escrow contract parameters");
-            return PrecheckEscrowSpend(tx, outNum, state, height, escrow);
+
+            if (actionKey == CVDXF::GetDataKey(CContractEscrow::ActionReleaseKeyName(), ...))
+            {
+                if (escrow.status != CContractEscrow::STATUS_FUNDED)
+                    return state.Error("Escrow not in funded state — cannot release");
+                // Verify signer authorization checked at import time
+            }
+            else if (actionKey == CVDXF::GetDataKey(CContractEscrow::ActionDisputeKeyName(), ...))
+            {
+                if (escrow.status != CContractEscrow::STATUS_FUNDED)
+                    return state.Error("Escrow not in funded state — cannot dispute");
+                if (!escrow.arbiter.IsValid())
+                    return state.Error("No arbiter defined for this escrow");
+            }
+            return true;
         }
 
-        case CVerusContract::CONTRACT_VESTING:
+        case CVerusContract::CONTRACT_LENDING:
         {
-            CContractVesting vesting = CContractVesting::FromIdentity(contractIdentity);
-            if (!vesting.IsValid())
-                return state.Error("Invalid vesting contract parameters");
-            return PrecheckVestingSpend(tx, outNum, state, height, vesting);
+            CContractLending lending = CContractLending::FromIdentity(contractIdentity);
+            if (actionKey == CVDXF::GetDataKey(CContractLending::ActionBorrowKeyName(), ...))
+            {
+                // Reject if collateral currency not in accepted list
+                // Reject if borrow currency not in lendable list
+            }
+            else if (actionKey == CVDXF::GetDataKey(CContractLending::ActionLiquidateKeyName(), ...))
+            {
+                // Reject if target position is NOT undercollateralized
+            }
+            return true;
         }
 
         default:
-            return state.Error("Unknown contract type");
+            return true;  // unknown contract type — allow transfer, import will handle
     }
-}
-
-// Example: Escrow precheck
-bool PrecheckEscrowSpend(const CTransaction &tx, int32_t outNum,
-                         CValidationState &state, uint32_t height,
-                         const CContractEscrow &escrow)
-{
-    // Find the action key in the spending transaction's reserve transfer auxdests
-    uint160 actionKey;
-    // ... extract from tx inputs ...
-
-    if (actionKey == CVDXF::GetDataKey(CContractEscrow::ActionReleaseKeyName(), ...))
-    {
-        // Release: verify signer is buyer (or buyer+seller depending on requiredSigs)
-        if (escrow.status != CContractEscrow::STATUS_FUNDED)
-            return state.Error("Escrow not in funded state — cannot release");
-
-        // Verify the spending transaction is signed by the buyer
-        // (check vin signatures against escrow.buyer)
-        // ...
-        return true;
-    }
-    else if (actionKey == CVDXF::GetDataKey(CContractEscrow::ActionDisputeKeyName(), ...))
-    {
-        if (escrow.status != CContractEscrow::STATUS_FUNDED)
-            return state.Error("Escrow not in funded state — cannot dispute");
-        if (!escrow.arbiter.IsValid())
-            return state.Error("No arbiter defined for this escrow");
-        return true;
-    }
-
-    // Timeout auto-refund: no action needed, import processor handles it
-    if (height >= escrow.timeout && escrow.status == CContractEscrow::STATUS_FUNDED)
-        return true;
-
-    return state.Error("Invalid escrow action");
 }
 ```
 
@@ -512,7 +469,7 @@ for (auto &oneTransfer : exportTransfers)
                 std::vector<CTxDestination> dests = {CIdentityID(destID)};
                 vOutputs.push_back(CTxOut(0,
                     MakeMofNCCScript(CConditionObj<CContractState>(
-                        EVAL_CONTRACT_SPEND, dests, 1, &newState))));
+                        EVAL_IDENTITY_PRIMARY, dests, 1, &newState))));
             }
             break;
         }
@@ -615,22 +572,22 @@ if (CVerusContract::IsContract(newIdentity))
 }
 ```
 
-### 1.10 ValidateContractSpend
+### 1.10 Identity Spending Restriction for Contracts
 
-**File: `src/pbaas/contracts.cpp`**
+Contract funds must only be spendable through import processing or recovery authority — not by the identity's primary key holders directly.
+
+**File: `src/pbaas/identity.cpp`** — Extend `ValidateIdentityPrimary` to check for contract VDXF keys when an identity's funds are being spent:
 
 ```cpp
-// Called when a EVAL_CONTRACT_SPEND UTXO is being spent
-// Ensures spending is only allowed through valid import transactions
-bool ValidateContractSpend(struct CCcontract_info *cp, Eval* eval,
-                           const CTransaction &tx, uint32_t nIn, bool fulfilled)
+// Inside existing ValidateIdentityPrimary, after identity is loaded:
+if (CVerusContract::IsContract(identity))
 {
-    // Contract funds can only be spent by:
-    // 1. An import transaction (EVAL_CROSSCHAIN_IMPORT in one of the outputs)
-    //    — this means the contract action was processed through proper consensus
-    // 2. Recovery authority (emergency recovery of contract identity)
+    // Contract identity funds can only be spent by:
+    // 1. An import transaction (contract action processed through consensus)
+    // 2. Recovery authority (emergency override)
+    // Primary key holders CANNOT directly spend contract funds
 
-    bool hasImport = false;
+    bool isImportSpend = false;
     for (int i = 0; i < tx.vout.size(); i++)
     {
         COptCCParams checkP;
@@ -638,21 +595,17 @@ bool ValidateContractSpend(struct CCcontract_info *cp, Eval* eval,
             checkP.IsValid() &&
             checkP.evalCode == EVAL_CROSSCHAIN_IMPORT)
         {
-            hasImport = true;
+            isImportSpend = true;
             break;
         }
     }
 
-    if (!hasImport)
-    {
-        // Check if this is a recovery spend by the recovery authority
-        // ... (similar to existing identity recovery validation)
-        return eval->Error("Contract funds can only be spent through import processing");
-    }
-
-    return true;
+    if (!isImportSpend && !isRecoverySpend)
+        return eval->Error("Contract funds can only be spent through contract actions or recovery");
 }
 ```
+
+This uses the existing identity spending validation path — no new eval code needed. The identity is recognized as a contract by the presence of `vrsc::contract.type` in its contentMultiMap.
 
 ### 1.11 RPC Commands
 
@@ -707,18 +660,17 @@ bool CheckContractActive(uint32_t height)
 
 | File | Change | Lines (est.) |
 |------|--------|-------------|
-| `cc/eval.h` | Add `EVAL_CONTRACT_SPEND` | 1 |
-| `cc/CCcustom.cpp` | Register eval code | 10 |
-| `cc/CCaddresses.cpp` | New CC address/pubkey/WIF | 3 |
-| `pbaas/vdxf.h` | VDXF key constants (~20 keys) | 200 |
-| **`pbaas/contracts.h`** (new) | Contract structs, serialization | 400 |
-| **`pbaas/contracts.cpp`** (new) | Precheck, validate, process logic | 800 |
+| `pbaas/vdxf.h` | VDXF key constants for contract types, actions, state (~30 keys) | 300 |
+| **`pbaas/contracts.h`** (new) | Contract structs, serialization, VDXF key helpers | 500 |
+| **`pbaas/contracts.cpp`** (new) | Precheck dispatch, process logic per template | 1000 |
 | `pbaas/reserves.cpp` | Contract dispatch in `AddReserveTransferImportOutputs` | 150 |
-| `pbaas/pbaas.cpp` | Contract check in `PrecheckReserveTransfer` | 50 |
+| `pbaas/pbaas.cpp` | Contract-aware check in `PrecheckReserveTransfer` | 60 |
 | `pbaas/pbaas.h` | Activation timestamp | 5 |
-| `pbaas/identity.cpp` | Contract validation at registration | 50 |
-| `rpc/pbaasrpc.cpp` | New RPC commands | 200 |
-| **Total** | | **~1870** |
+| `pbaas/identity.cpp` | Contract validation at registration + spending restriction | 80 |
+| `rpc/pbaasrpc.cpp` | New RPC commands (createcontract, getcontract, contractaction) | 200 |
+| **Total** | | **~2300** |
+
+No changes to `cc/eval.h`, `cc/CCcustom.cpp`, or `cc/CCaddresses.cpp` — contracts operate entirely through VDXF keys within the existing smart transaction framework.
 
 ---
 
@@ -748,15 +700,17 @@ Actions are submitted as reserve transfers with action VDXF keys in `auxDests` b
 
 4. **Cross-chain for free**: If a contract identity is exported to a PBaaS chain, actions can be sent cross-chain through the existing bridge. No additional cross-chain code needed.
 
-### 3.3 Why One Eval Code (Not One Per Template)
+### 3.3 Why VDXF Keys, Not Eval Codes
 
-A single `EVAL_CONTRACT_SPEND` eval code with internal dispatch is preferable to one eval code per template because:
+Contracts use VDXF keys rather than new eval codes because:
 
-1. **Eval codes are scarce**: Only 256 possible (uint8). Currently 26 are used. Each new template type shouldn't consume one.
+1. **Right abstraction layer**: Eval codes are deep protocol primitives — the lowest level of the smart transaction system. Contracts are a higher-level concept built ON those primitives. Adding an eval code for contracts would be like adding a new CPU instruction for every application.
 
-2. **Same validation pattern**: All contract spends follow the same pattern (must be via import or recovery). The type-specific logic is in the import processor, not the spend validator.
+2. **VDXF is designed for this**: VDXF keys are Verus's extensibility mechanism — they describe functions, data types, and actions without modifying the protocol core. Contract types and actions are exactly the kind of thing VDXF keys are for.
 
-3. **Extensibility**: New contract templates can be added without touching eval.h or CCcustom.cpp — just add a new case to the dispatch switch.
+3. **Extensibility**: New contract templates can be added by defining new VDXF keys and adding dispatch cases in `contracts.cpp`. No protocol-level changes needed — no new eval codes, no new smart transaction registrations, no hard fork for each template.
+
+4. **Identity-native recognition**: Contract identities are recognized by checking their contentMultiMap for the `vrsc::contract.type` VDXF key. This uses the existing identity infrastructure rather than requiring a parallel recognition system.
 
 ---
 
@@ -846,6 +800,340 @@ vrsc::contract.conditional.timeout       = uint32(4100000)
 **Timeout:** Block 4100000 reached without attestation
 → Funds go to fallback address
 
+### 4.6 Lending Pool (`vrsc::contract.template.lending`)
+
+Collateralized lending using basket conversion prices as on-chain oracle — no external price feed needed.
+
+**Why Verus can do this without Turing completeness:**
+Ethereum lending protocols (Aave, Compound) need Chainlink oracles for price feeds. Verus basket currencies already have `lastconversionprice` and `viaconversionprice` updated every block by actual market activity in `CCoinbaseCurrencyState`. These prices are consensus-level, manipulation-resistant (you'd have to move real reserves), and already used for reserve-to-reserve conversions. The lending template reads these directly — zero oracle infrastructure needed.
+
+**Parameters:**
+```
+vrsc::contract.type                     = uint8(6)  // CONTRACT_LENDING
+vrsc::contract.lending.collateral       = [uint160]  // accepted collateral currency IDs
+vrsc::contract.lending.borrow           = [uint160]  // lendable currency IDs
+vrsc::contract.lending.pricefeed        = uint160    // basket currency ID whose conversion prices are the oracle
+vrsc::contract.lending.ltv              = uint32     // max loan-to-value in basis points (e.g. 7500 = 75%)
+vrsc::contract.lending.liquidation      = uint32     // liquidation threshold in basis points (e.g. 8500 = 85%)
+vrsc::contract.lending.liquidationbonus = uint32     // bonus for liquidators in basis points (e.g. 500 = 5%)
+vrsc::contract.lending.interestmodel    = serialized {baseRate, slope1, slope2, kink}
+  // Two-slope interest model (like Compound):
+  // if utilization <= kink: rate = baseRate + utilization * slope1
+  // if utilization >  kink: rate = baseRate + kink * slope1 + (utilization - kink) * slope2
+  // All values in basis points per block
+vrsc::contract.lending.maxpositions     = uint32     // max concurrent borrow positions (caps state size)
+```
+
+**State:**
+```
+vrsc::contract.state.lending.pool       = serialized {
+  totalDeposited:    CCurrencyValueMap   // total lender deposits by currency
+  totalBorrowed:     CCurrencyValueMap   // total outstanding borrows by currency
+  lastAccrualHeight: uint32             // last block interest was accrued
+  accumulatedRate:   int64[]            // accumulated interest rate per currency (scaled by 1e18)
+}
+
+vrsc::contract.state.lending.position   = [multiple entries, one per borrower]
+  Each entry (serialized):
+    borrower:        uint160            // borrower identity ID
+    collateralCurrency: uint160
+    collateralAmount:   int64
+    borrowCurrency:  uint160
+    borrowAmount:    int64              // principal at time of borrow
+    entryRate:       int64              // accumulatedRate at time of borrow (for interest calc)
+```
+
+**C++ Data Structure:**
+
+```cpp
+class CContractLending
+{
+public:
+    struct InterestModel
+    {
+        uint32_t baseRateBP;    // base rate per block in basis points (scaled 1e8)
+        uint32_t slope1BP;      // slope below kink
+        uint32_t slope2BP;      // slope above kink
+        uint32_t kinkBP;        // utilization kink point (basis points, e.g. 8000 = 80%)
+
+        // Calculate per-block interest rate given utilization (0-10000 BP)
+        int64_t GetRate(uint32_t utilizationBP) const
+        {
+            if (utilizationBP <= kinkBP)
+                return baseRateBP + ((int64_t)utilizationBP * slope1BP) / 10000;
+            else
+                return baseRateBP + ((int64_t)kinkBP * slope1BP) / 10000
+                     + ((int64_t)(utilizationBP - kinkBP) * slope2BP) / 10000;
+        }
+
+        ADD_SERIALIZE_METHODS;
+        template <typename Stream, typename Operation>
+        inline void SerializationOp(Stream& s, Operation ser_action) {
+            READWRITE(VARINT(baseRateBP));
+            READWRITE(VARINT(slope1BP));
+            READWRITE(VARINT(slope2BP));
+            READWRITE(VARINT(kinkBP));
+        }
+    };
+
+    struct Position
+    {
+        uint160 borrowerID;
+        uint160 collateralCurrencyID;
+        int64_t collateralAmount;
+        uint160 borrowCurrencyID;
+        int64_t borrowAmount;
+        int64_t entryRate;              // accumulatedRate snapshot at borrow time
+
+        // Current debt = borrowAmount * (currentAccumulatedRate / entryRate)
+        int64_t GetCurrentDebt(int64_t currentAccumulatedRate) const
+        {
+            if (entryRate <= 0) return borrowAmount;
+            return (int64_t)((__int128)borrowAmount * currentAccumulatedRate / entryRate);
+        }
+
+        ADD_SERIALIZE_METHODS;
+        template <typename Stream, typename Operation>
+        inline void SerializationOp(Stream& s, Operation ser_action) {
+            READWRITE(borrowerID);
+            READWRITE(collateralCurrencyID);
+            READWRITE(VARINT(collateralAmount));
+            READWRITE(borrowCurrencyID);
+            READWRITE(VARINT(borrowAmount));
+            READWRITE(VARINT(entryRate));
+        }
+    };
+
+    std::vector<uint160> collateralCurrencies;
+    std::vector<uint160> borrowCurrencies;
+    uint160 priceFeedBasket;                    // basket whose prices are the oracle
+    uint32_t maxLTV;                            // basis points
+    uint32_t liquidationThreshold;              // basis points
+    uint32_t liquidationBonus;                  // basis points
+    InterestModel interestModel;
+    uint32_t maxPositions;
+
+    // Price lookup: read from basket currency state (no external oracle)
+    // Returns price of currencyID in terms of the basket's native reserve
+    static int64_t GetPrice(const uint160 &currencyID, const uint160 &basketID, uint32_t height)
+    {
+        // Read the basket's latest currency state from the notarization chain
+        CCoinbaseCurrencyState basketState = ConnectedChains.GetCurrencyState(basketID, height);
+        auto reserveMap = basketState.GetReserveMap();
+        auto it = reserveMap.find(currencyID);
+        if (it == reserveMap.end()) return 0;
+        int index = it->second;
+        if (index < 0 || index >= basketState.conversionPrice.size()) return 0;
+        return basketState.conversionPrice[index];
+    }
+
+    // Collateral ratio = (collateral * collateralPrice) / (debt * borrowPrice)
+    // Returns basis points (10000 = 100%)
+    uint32_t GetCollateralRatioBP(const Position &pos, int64_t currentAccumulatedRate, uint32_t height) const
+    {
+        int64_t debt = pos.GetCurrentDebt(currentAccumulatedRate);
+        if (debt <= 0) return 10000;
+        int64_t collateralValue = ((__int128)pos.collateralAmount * GetPrice(pos.collateralCurrencyID, priceFeedBasket, height)) / SATOSHIDEN;
+        int64_t debtValue = ((__int128)debt * GetPrice(pos.borrowCurrencyID, priceFeedBasket, height)) / SATOSHIDEN;
+        if (debtValue <= 0) return 10000;
+        return (uint32_t)(((__int128)collateralValue * 10000) / debtValue);
+    }
+
+    static std::string PoolKeyName()        { return "vrsc::contract.lending.pool"; }
+    static std::string PositionKeyName()    { return "vrsc::contract.state.lending.position"; }
+    static std::string ActionDepositKeyName()   { return "vrsc::contract.action.lending.deposit"; }
+    static std::string ActionBorrowKeyName()    { return "vrsc::contract.action.lending.borrow"; }
+    static std::string ActionRepayKeyName()     { return "vrsc::contract.action.lending.repay"; }
+    static std::string ActionWithdrawKeyName()  { return "vrsc::contract.action.lending.withdraw"; }
+    static std::string ActionLiquidateKeyName() { return "vrsc::contract.action.lending.liquidate"; }
+
+    static CContractLending FromIdentity(const CIdentity &identity);
+    bool IsValid() const;
+
+    ADD_SERIALIZE_METHODS;
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        READWRITE(collateralCurrencies);
+        READWRITE(borrowCurrencies);
+        READWRITE(priceFeedBasket);
+        READWRITE(VARINT(maxLTV));
+        READWRITE(VARINT(liquidationThreshold));
+        READWRITE(VARINT(liquidationBonus));
+        READWRITE(interestModel);
+        READWRITE(VARINT(maxPositions));
+    }
+};
+```
+
+**Import Processing:**
+
+```cpp
+case CVerusContract::CONTRACT_LENDING:
+{
+    CContractLending lending = CContractLending::FromIdentity(contractIdentity);
+    CContractState currentState; // read from state UTXO chain
+
+    // Accrue interest first — update accumulatedRate for all blocks since lastAccrualHeight
+    uint32_t blocksSinceAccrual = height - currentState.lastAccrualHeight;
+    if (blocksSinceAccrual > 0)
+    {
+        for (auto &currency : lending.borrowCurrencies)
+        {
+            int64_t totalDeposited = /* from state */;
+            int64_t totalBorrowed = /* from state */;
+            uint32_t utilization = totalDeposited > 0
+                ? (uint32_t)((int64_t)totalBorrowed * 10000 / totalDeposited)
+                : 0;
+            int64_t ratePerBlock = lending.interestModel.GetRate(utilization);
+            // Compound: accumulatedRate *= (1 + ratePerBlock)^blocks
+            // Use fixed-point multiplication to avoid overflow
+        }
+    }
+
+    // Dispatch action
+    uint160 actionKey = /* from auxDests */;
+
+    if (actionKey == depositKey)
+    {
+        // Lender deposits funds into pool
+        // Update totalDeposited in state
+        // Create pool share tracking for this lender
+    }
+    else if (actionKey == borrowKey)
+    {
+        // Borrower has sent collateral in this transfer
+        // Check LTV: collateralValue * maxLTV / 10000 >= borrowAmount * borrowPrice
+        // Create Position in state
+        // Create output: borrowed amount to borrower
+    }
+    else if (actionKey == repayKey)
+    {
+        // Borrower repays debt (transfer contains repayment amount)
+        // Calculate current debt with interest
+        // Update or close Position
+        // Return collateral if fully repaid
+    }
+    else if (actionKey == withdrawKey)
+    {
+        // Lender withdraws from pool
+        // Check available liquidity (deposited - borrowed)
+        // Create output: withdrawn amount to lender
+    }
+    else if (actionKey == liquidateKey)
+    {
+        // Anyone can liquidate an undercollateralized position
+        // Check: GetCollateralRatioBP(position) < liquidationThreshold
+        // Liquidator pays off debt, receives collateral + bonus
+        // Uses basket conversion prices for all valuations
+        //
+        // This is manipulation-resistant because moving basket prices
+        // requires actual reserve deposits/withdrawals — you can't
+        // fake a price to trigger liquidation without putting up real money
+    }
+
+    // Write updated state UTXO
+    break;
+}
+```
+
+**Precheck:**
+
+```cpp
+case CVerusContract::CONTRACT_LENDING:
+{
+    CContractLending lending = CContractLending::FromIdentity(contractIdentity);
+
+    if (actionKey == borrowKey)
+    {
+        // Reject if collateral currency not in accepted list
+        // Reject if borrow currency not in lendable list
+        // Reject if collateral amount is 0
+        // Reject if maxPositions would be exceeded
+    }
+    else if (actionKey == liquidateKey)
+    {
+        // Read position from state
+        // Read current prices from basket
+        // Reject if position is NOT undercollateralized (healthy position)
+        // This prevents griefing — can't liquidate someone who's fine
+    }
+    else if (actionKey == withdrawKey)
+    {
+        // Reject if withdrawal would make pool insolvent
+        // (can't withdraw more than deposited - borrowed)
+    }
+    return true;
+}
+```
+
+**Deploy:**
+```
+verus createcontract '{
+  "type": "lending",
+  "name": "vrsc-lending-pool",
+  "collateral": ["DAI", "vETH", "MKR"],
+  "borrow": ["VRSC"],
+  "pricefeed": "Bridge.vETH",
+  "ltv": 7500,
+  "liquidation": 8500,
+  "liquidationbonus": 500,
+  "interest": {"base": 200, "slope1": 400, "slope2": 7500, "kink": 8000},
+  "maxpositions": 1000
+}'
+```
+
+**User flow:**
+```bash
+# Lender deposits 1000 VRSC into pool
+verus contractaction vrsc-lending-pool@ deposit \
+  '{"currency":"VRSC","amount":1000}'
+
+# Borrower deposits 10 vETH collateral, borrows 500 VRSC
+verus contractaction vrsc-lending-pool@ borrow \
+  '{"collateral":"vETH","collateralAmount":10,"borrow":"VRSC","borrowAmount":500}'
+
+# Borrower repays 505 VRSC (principal + interest)
+verus contractaction vrsc-lending-pool@ repay \
+  '{"currency":"VRSC","amount":505}'
+
+# Anyone can liquidate if collateral ratio drops below 85%
+verus contractaction vrsc-lending-pool@ liquidate \
+  '{"borrower":"defaulter@"}'
+```
+
+**Why basket prices work as oracle:**
+
+On Ethereum, Chainlink is needed because there's no native price source. On Verus, every basket currency maintains `conversionPrice[]` in its `CCoinbaseCurrencyState`, updated every block through actual reserve conversions. These prices are:
+
+1. **Consensus-level** — all nodes agree on the same prices
+2. **Manipulation-resistant** — moving a price requires depositing/withdrawing real reserves from the basket. An attacker can't flash-loan their way to a fake price because there are no flash loans on UTXO.
+3. **Always available** — no oracle downtime, no stale prices, no need to trust a third party
+4. **Already used for conversions** — the same prices that execute reserve-to-reserve swaps
+
+The lending template's `priceFeedBasket` parameter points to a basket (like `Bridge.vETH`) that contains the relevant currencies. The `GetPrice()` function reads `conversionPrice[i]` directly from the basket's latest notarization. No external infrastructure.
+
+---
+
+### What Verus Already Handles Natively (No Templates Needed)
+
+These common smart contract use cases are already consensus features:
+
+| Use Case | Verus Native Feature |
+|----------|---------------------|
+| **Tokens (ERC-20)** | `definecurrency` — any token with built-in conversion |
+| **DEX / AMM** | Basket currencies with fractional reserves |
+| **Stablecoins** | Reserve-backed baskets (e.g., DAI.vETH) |
+| **Bridges** | PBaaS + Ethereum bridge — trustless cross-chain |
+| **Multisig** | VerusID `minSigs` + multiple primary addresses |
+| **Fundraising / ICO** | Preconversion phase of currency launches |
+| **Governance** | `EVAL_VOTING_GOVERNANCE`, `EVAL_VOTING_VOTE`, `EVAL_VOTING_POLL` |
+| **Dead Man's Switch** | VerusID `unlockAfter` timelock — funds locked until block/time |
+| **Rate Limiting** | VerusID timelock + spending conditions |
+| **Time-Delayed Vault** | VerusID timelock — all spends delayed, revocation can cancel |
+| **Key Recovery** | VerusID recovery authority — change keys without moving funds |
+
+These don't need templates because they're already baked into the protocol at the consensus level.
+
 ---
 
 ## Part 5: Upgrade Path
@@ -865,3 +1153,10 @@ vrsc::contract.conditional.timeout       = uint32(4100000)
 - Builds on Phase 2 infrastructure
 - Introduces time-based auto-triggers (subscription pulls, conditional timeouts)
 - ~400 lines additional
+
+### Phase 4: Lending
+- Most complex template — multi-position state, interest accrual, liquidation
+- Depends on Phase 2 infrastructure (state UTXOs, actions)
+- Uses basket conversion prices as oracle (no new price infrastructure)
+- ~600 lines additional
+- Should be heavily tested on testnet — lending bugs can lose real funds
