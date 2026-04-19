@@ -24,7 +24,7 @@ A contract identity is just a normal VerusID whose `contentMultiMap` contains a 
 
 > **Note on source naming:** The source code still uses legacy Komodo naming (`cc/`, `CCcustom.cpp`, `COptCCParams`, etc.) from the crypto-conditions era. Verus Smart Transactions are architecturally different — they use a verified precheck system that goes far beyond form validation, rejecting anything clearly recognizable as unable to succeed. File paths below reflect the current source layout, not the architecture.
 
-### 1.3 New Contract Data Structure
+### 1.2 New Contract Data Structure
 
 **New file: `src/pbaas/contracts.h`**
 
@@ -33,7 +33,9 @@ A contract identity is just a normal VerusID whose `contentMultiMap` contains a 
 #include "reserves.h"
 #include "vdxf.h"
 
-// Contract template identifiers — each maps to a uint160 VDXF key
+// Contract template identifiers — stored as uint160 VDXF key hashes in contentMultiMap.
+// The on-chain value of vrsc::contract.type is a uint160 (the VDXF key hash of the template),
+// NOT an integer enum. The enum below is for internal dispatch only.
 class CVerusContract
 {
 public:
@@ -48,12 +50,22 @@ public:
         CONTRACT_LENDING = 6,
     };
 
-    // VDXF key names for contract namespace
+    // VDXF key names — the on-chain contract type value is the uint160 hash of these
     static std::string ContractTypeKeyName()        { return "vrsc::contract.type"; }
     static std::string ContractVersionKeyName()     { return "vrsc::contract.version"; }
 
+    // Template VDXF key names — stored as uint160 hashes in the multimap
+    static std::string SplitterTemplateName()       { return "vrsc::contract.template.splitter"; }
+    static std::string EscrowTemplateName()         { return "vrsc::contract.template.escrow"; }
+    static std::string VestingTemplateName()        { return "vrsc::contract.template.vesting"; }
+    static std::string SubscriptionTemplateName()   { return "vrsc::contract.template.subscription"; }
+    static std::string ConditionalTemplateName()    { return "vrsc::contract.template.conditional"; }
+    static std::string LendingTemplateName()        { return "vrsc::contract.template.lending"; }
+
     // Read contract type from an identity's contentMultiMap
-    // Returns CONTRACT_INVALID if identity is not a contract
+    // Reads the uint160 value stored at vrsc::contract.type key,
+    // matches it against known template VDXF key hashes,
+    // returns the internal enum for dispatch
     static EContractType GetContractType(const CIdentity &identity);
 
     // Check if an identity is a contract
@@ -75,6 +87,15 @@ public:
         static uint160 key = CVDXF::GetDataKey(ContractVersionKeyName(), nameSpace);
         return key;
     }
+
+    // Template key lookups — for matching against the stored type value
+    static uint160 SplitterTemplateKey()
+    {
+        static uint160 nameSpace;
+        static uint160 key = CVDXF::GetDataKey(SplitterTemplateName(), nameSpace);
+        return key;
+    }
+    // ... same pattern for each template
 };
 
 // ============================================================
@@ -240,7 +261,7 @@ public:
 };
 ```
 
-### 1.4 VDXF Key Registration
+### 1.3 VDXF Key Registration
 
 **File: `src/pbaas/vdxf.h`** — Add static key functions following the existing pattern (currently lines 259-786):
 
@@ -264,7 +285,7 @@ static std::string ContractVestingScheduleKeyName()     { return "vrsc::contract
 // ... etc, each with matching Key() function
 ```
 
-### 1.5 Contract State — Separate UTXO (Recommended)
+### 1.4 Contract State — Separate UTXO (Recommended)
 
 Rather than modifying identities from consensus (which would break the identity authorization model), contract state lives in a separate UTXO type, analogous to how `CCoinbaseCurrencyState` lives in notarizations, not in `CCurrencyDefinition`.
 
@@ -304,7 +325,7 @@ public:
 
 The state UTXO is held at the contract identity's address under the identity's existing smart transaction type. On each state transition, the import processor spends the old state UTXO and creates a new one with updated values. This is exactly how notarizations work — each new notarization spends the previous one. Contract identity recognition happens via VDXF key lookup, not a dedicated eval code.
 
-### 1.6 Precheck — Extend Existing PrecheckReserveTransfer
+### 1.5 Precheck — Extend Existing PrecheckReserveTransfer
 
 **File: `src/pbaas/pbaas.cpp`** — The contract precheck logic is added INSIDE the existing `PrecheckReserveTransfer()` function (line 4894), not as a separate precheck function. When a reserve transfer targets an identity with `vrsc::contract.type` in its multimap, the precheck dispatches to template-specific validation.
 
@@ -324,15 +345,10 @@ bool PrecheckContractTransfer(const CReserveTransfer &rt,
 
     CVerusContract::EContractType cType = CVerusContract::GetContractType(contractIdentity);
 
-    // Extract action VDXF key from auxDests (if present)
-    uint160 actionKey;
-    if (rt.destination.AuxDestCount() > 0)
-    {
-        CTransferDestination auxDest;
-        rt.destination.GetAuxDest(auxDest, 0);
-        if (auxDest.TypeNoFlags() == CTransferDestination::DEST_ID)
-            actionKey = CIdentityID(auxDest.destination);
-    }
+    // Extract action from gatewayCode — CTransferDestination already has this field
+    // for specifying "code for function to execute on the gateway".
+    // The contract identity IS the gateway; gatewayCode is the VDXF key of the action.
+    uint160 actionKey = rt.destination.gatewayCode;
 
     switch (cType)
     {
@@ -383,7 +399,7 @@ bool PrecheckContractTransfer(const CReserveTransfer &rt,
 }
 ```
 
-### 1.7 Import Processing — Extend AddReserveTransferImportOutputs
+### 1.6 Import Processing — Extend AddReserveTransferImportOutputs
 
 **File: `src/pbaas/reserves.cpp`** — Inside `AddReserveTransferImportOutputs()` (the 2200-line function at line 4244), after the existing transfer processing loop, add contract dispatch.
 
@@ -444,14 +460,8 @@ for (auto &oneTransfer : exportTransfers)
 
             CContractEscrow escrow = CContractEscrow::FromIdentity(contractIdentity);
 
-            // Determine action from auxDests
-            uint160 actionKey;
-            if (dest.AuxDestCount() > 0)
-            {
-                CTransferDestination auxDest;
-                dest.GetAuxDest(auxDest, 0);
-                actionKey = CIdentityID(auxDest.destination);
-            }
+            // Determine action from gatewayCode
+            uint160 actionKey = dest.gatewayCode;
 
             auto result = escrow.ProcessAction(actionKey, ..., height, ...);
             if (result.valid)
@@ -490,7 +500,7 @@ for (auto &oneTransfer : exportTransfers)
 }
 ```
 
-### 1.8 PrecheckReserveTransfer Extension
+### 1.7 PrecheckReserveTransfer Extension
 
 **File: `src/pbaas/pbaas.cpp`** — In `PrecheckReserveTransfer()` (line 4894), add contract-aware validation. After the existing destination checks (~line 5050), add:
 
@@ -537,7 +547,7 @@ if (rt.destination.TypeNoFlags() == CTransferDestination::DEST_ID && haveFullCha
 }
 ```
 
-### 1.9 Contract Creation — Identity Registration Hook
+### 1.8 Contract Creation — Identity Registration Hook
 
 **File: `src/pbaas/identity.cpp`** — In the identity registration validation, add contract parameter validation when an identity includes `vrsc::contract.type` in its multimap.
 
@@ -572,7 +582,7 @@ if (CVerusContract::IsContract(newIdentity))
 }
 ```
 
-### 1.10 Identity Spending Restriction for Contracts
+### 1.9 Identity Spending Restriction for Contracts
 
 Contract funds must only be spendable through import processing or recovery authority — not by the identity's primary key holders directly.
 
@@ -607,7 +617,7 @@ if (CVerusContract::IsContract(identity))
 
 This uses the existing identity spending validation path — no new eval code needed. The identity is recognized as a contract by the presence of `vrsc::contract.type` in its contentMultiMap.
 
-### 1.11 RPC Commands
+### 1.10 RPC Commands
 
 **File: `src/rpc/pbaasrpc.cpp`** — Add new RPC methods:
 
@@ -636,7 +646,7 @@ UniValue contractaction(const UniValue& params, bool fHelp)
 }
 ```
 
-### 1.12 Activation Height
+### 1.11 Activation Height
 
 **File: `src/pbaas/pbaas.h`** — Add activation timestamp like existing upgrades:
 
@@ -666,7 +676,7 @@ bool CheckContractActive(uint32_t height)
 | `pbaas/reserves.cpp` | Contract dispatch in `AddReserveTransferImportOutputs` | 150 |
 | `pbaas/pbaas.cpp` | Contract-aware check in `PrecheckReserveTransfer` | 60 |
 | `pbaas/pbaas.h` | Activation timestamp | 5 |
-| `pbaas/identity.cpp` | Contract validation at registration + spending restriction | 80 |
+| `pbaas/identity.cpp` | Contract validation at registration + spending restriction + param immutability | 120 |
 | `rpc/pbaasrpc.cpp` | New RPC commands (createcontract, getcontract, contractaction) | 200 |
 | **Total** | | **~2300** |
 
@@ -688,17 +698,21 @@ Contract state should NOT live in the identity's contentMultiMap because:
 
 4. **No identity output churn**: Contract activity (which could be frequent) doesn't create new identity outputs. The identity remains stable; only the state UTXO changes.
 
-### 3.2 Why Reuse Reserve Transfers for Actions
+### 3.2 Why Reserve Transfers with gatewayCode for Actions
 
-Actions are submitted as reserve transfers with action VDXF keys in `auxDests` because:
+Contract actions are submitted as reserve transfers. The action is specified via `CTransferDestination.gatewayCode` — a `uint160` field that already exists for specifying "code for function to execute on the gateway." The contract identity IS the gateway; the `gatewayCode` is the VDXF key hash of the action (e.g., `vrsc::contract.action.escrow.release`).
 
-1. **No new transaction type needed**: Reserve transfers are already the universal "do something" mechanism. The existing export → import pipeline handles aggregation, ordering, and atomic processing.
+This is cleaner than using `auxDests` because:
 
-2. **Fee infrastructure exists**: Reserve transfers already have fee validation, cross-chain routing, and the precheck pipeline.
+1. **gatewayCode exists for exactly this purpose**: It's a dedicated field for "what function to run at the destination." Using it for contract actions is using it as designed.
 
-3. **auxDests already exist**: `CTransferDestination.auxDests` supports up to 3 auxiliary destinations (checked at line 4920 of pbaas.cpp). Using one slot for a VDXF action key is a natural extension — the action key is just another `DEST_ID` pointing to a VDXF key hash.
+2. **No new transaction type needed**: Reserve transfers are already the universal "do something" mechanism. The existing export → import pipeline handles aggregation, ordering, and atomic processing.
+
+3. **Fee infrastructure exists**: Reserve transfers already have fee validation, cross-chain routing, and the precheck pipeline.
 
 4. **Cross-chain for free**: If a contract identity is exported to a PBaaS chain, actions can be sent cross-chain through the existing bridge. No additional cross-chain code needed.
+
+5. **auxDests remain available**: Since gatewayCode handles the action, all 3 auxDest slots remain free for action-specific parameters (e.g., which borrower to liquidate).
 
 ### 3.3 Why VDXF Keys, Not Eval Codes
 
@@ -712,6 +726,74 @@ Contracts use VDXF keys rather than new eval codes because:
 
 4. **Identity-native recognition**: Contract identities are recognized by checking their contentMultiMap for the `vrsc::contract.type` VDXF key. This uses the existing identity infrastructure rather than requiring a parallel recognition system.
 
+### 3.4 Transfers Must Go Through Import Pipeline
+
+Contract logic executes during `AddReserveTransferImportOutputs`. A normal `sendtoaddress` to a contract identity creates a direct UTXO — it never hits the import pipeline, so no contract logic runs.
+
+**Solution: Contracts only accept reserve transfers.** All interactions with a contract identity must use `sendcurrency` (which creates reserve transfers), not `sendtoaddress`. The precheck in `PrecheckReserveTransfer` validates contract-bound transfers. Direct sends to a contract identity's address are rejected by the spending restriction (section 1.9) — the funds would be stuck since only import processing or recovery can spend them.
+
+This is enforced by:
+1. **Section 1.9 spending restriction**: Contract identity UTXOs can only be spent via import or recovery. If someone sends via `sendtoaddress`, the UTXO exists but can never be spent through normal means — only recovered.
+2. **RPC helper**: The `contractaction` RPC always constructs a reserve transfer, never a raw send.
+3. **Wallet warning**: If a wallet detects a contract identity as destination, it should warn the user to use `sendcurrency` / `contractaction` instead.
+
+### 3.5 State UTXO Recognition
+
+Without a dedicated eval code, state UTXOs must be distinguishable from normal identity outputs. 
+
+**Solution: State is stored as VDXF-structured data within the output script.** The state UTXO contains a `CContractState` object serialized as VDXF structured data (using the existing `vrsc::system.structureddata` pattern). The contract processor recognizes state UTXOs by checking for the `vrsc::contract.state` VDXF key in the output's structured data.
+
+When the import processor needs to find the current state for a contract:
+1. Look up UTXOs at the contract identity's address
+2. For each UTXO, check if it contains VDXF structured data with key `vrsc::contract.state`
+3. The one with the highest `blockHeight` in its `CContractState` is the current state
+
+State UTXOs form a chain — each state transition spends the previous state UTXO and creates a new one, exactly like notarizations.
+
+### 3.6 Contract Parameter Immutability
+
+Contract parameters (`vrsc::contract.params.*` and `vrsc::contract.type`) must be immutable after the identity is created. Otherwise, a contract owner could change splitter shares, escrow parties, or lending terms after users have deposited funds.
+
+**Solution: Reject identity updates that modify contract keys.**
+
+**File: `src/pbaas/identity.cpp`** — In `ValidateIdentityPrimary`, when an identity update is being validated:
+
+```cpp
+// If the existing identity is a contract, reject updates to contract keys
+if (CVerusContract::IsContract(existingIdentity))
+{
+    CIdentity newIdentity(tx, ...);
+
+    // Compare contract-relevant multimap entries
+    // vrsc::contract.type and vrsc::contract.params.* must be identical
+    uint160 typeKey = CVerusContract::ContractTypeKey();
+    auto oldType = existingIdentity.contentMultiMap.find(typeKey);
+    auto newType = newIdentity.contentMultiMap.find(typeKey);
+
+    if (oldType == existingIdentity.contentMultiMap.end() ||
+        newType == newIdentity.contentMultiMap.end() ||
+        oldType->second != newType->second)
+    {
+        return eval->Error("Cannot modify contract type after deployment");
+    }
+
+    // Check all vrsc::contract.params.* keys — none may be added, removed, or changed
+    // vrsc::contract.state.* keys are NOT checked here — they're updated by consensus
+    // (but state updates happen via state UTXOs, not identity updates)
+}
+```
+
+The identity owner CAN still:
+- Update non-contract multimap keys (profile, social, etc.)
+- Update primary addresses (change signing keys)
+- The revocation authority can revoke (pause the contract)
+- The recovery authority can recover (emergency override)
+
+The identity owner CANNOT:
+- Change `vrsc::contract.type`
+- Change any `vrsc::contract.params.*` key
+- Remove contract keys (would effectively delete the contract)
+
 ---
 
 ## Part 4: Contract Templates
@@ -720,7 +802,7 @@ Contracts use VDXF keys rather than new eval codes because:
 
 **Deploy:** Register identity `my-split@` with contentMultiMap:
 ```
-vrsc::contract.type                 = uint8(1)  // CONTRACT_SPLITTER
+vrsc::contract.type                 = VDXF_KEY("vrsc::contract.template.splitter")
 vrsc::contract.splitter.recipients  = serialized vector of {destination, shareBPs}
 vrsc::contract.splitter.minpayout   = int64(100000)  // 0.001 VRSC minimum
 ```
@@ -733,7 +815,7 @@ vrsc::contract.splitter.minpayout   = int64(100000)  // 0.001 VRSC minimum
 
 **Deploy:** Register identity `deal-escrow@` with contentMultiMap:
 ```
-vrsc::contract.type              = uint8(2)  // CONTRACT_ESCROW
+vrsc::contract.type              = VDXF_KEY("vrsc::contract.template.escrow")
 vrsc::contract.escrow.parties    = {buyer: "alice@", seller: "bob@", arbiter: "carol@"}
 vrsc::contract.escrow.amount     = int64(1000000000)  // 10 VRSC
 vrsc::contract.escrow.currency   = VRSC currency ID
@@ -754,7 +836,7 @@ vrsc::contract.escrow.require    = uint8(1)  // buyer-only release
 
 **Deploy:** Register identity `team-vest@` with contentMultiMap + fund it:
 ```
-vrsc::contract.type                 = uint8(3)  // CONTRACT_VESTING
+vrsc::contract.type                 = VDXF_KEY("vrsc::contract.template.vesting")
 vrsc::contract.vesting.beneficiary  = "employee@"
 vrsc::contract.vesting.schedule     = {amount: 100M sats, start: 4000000, cliff: 4050000,
                                        end: 4200000, interval: 1440}  // daily claims
@@ -767,7 +849,7 @@ vrsc::contract.vesting.schedule     = {amount: 100M sats, start: 4000000, cliff:
 
 **Deploy:** Register identity `my-sub@`:
 ```
-vrsc::contract.type                     = uint8(4)
+vrsc::contract.type                     = VDXF_KEY("vrsc::contract.template.subscription")
 vrsc::contract.subscription.provider    = "service@"
 vrsc::contract.subscription.amount      = int64(100000000)  // 1 VRSC/period
 vrsc::contract.subscription.currency    = VRSC
@@ -786,7 +868,7 @@ vrsc::contract.subscription.period      = uint32(43200)     // ~30 days
 
 **Deploy:** Register identity `bet-contract@`:
 ```
-vrsc::contract.type                      = uint8(5)
+vrsc::contract.type                      = VDXF_KEY("vrsc::contract.template.conditional")
 vrsc::contract.conditional.oracle        = "weather-oracle@"
 vrsc::contract.conditional.attestkey     = vrsc::oracle.attestation.event.X
 vrsc::contract.conditional.recipient     = "alice@"
@@ -809,7 +891,7 @@ Ethereum lending protocols (Aave, Compound) need Chainlink oracles for price fee
 
 **Parameters:**
 ```
-vrsc::contract.type                     = uint8(6)  // CONTRACT_LENDING
+vrsc::contract.type                     = VDXF_KEY("vrsc::contract.template.lending")
 vrsc::contract.lending.collateral       = [uint160]  // accepted collateral currency IDs
 vrsc::contract.lending.borrow           = [uint160]  // lendable currency IDs
 vrsc::contract.lending.pricefeed        = uint160    // basket currency ID whose conversion prices are the oracle
@@ -986,7 +1068,11 @@ case CVerusContract::CONTRACT_LENDING:
                 : 0;
             int64_t ratePerBlock = lending.interestModel.GetRate(utilization);
             // Compound: accumulatedRate *= (1 + ratePerBlock)^blocks
-            // Use fixed-point multiplication to avoid overflow
+            // PRECISION NOTE: With large block gaps (1000+ blocks between interactions),
+            // naive exponentiation overflows. Use exponentiation by squaring with __int128
+            // intermediate values, scaled by 1e18. The existing Verus codebase uses
+            // cpp_dec_float_50 for similar calculations in CalculateFractionalOut() —
+            // the same approach should be used here for consistency and safety.
         }
     }
 
