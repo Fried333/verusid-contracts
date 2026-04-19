@@ -15,12 +15,15 @@ This spec defines two layers of programmable behavior for VerusIDs, both impleme
 | **Contract** | Locked (usually) | Define what happens to funds | Escrow, splitter, vesting, lending |
 | **Contract** | Unlocked (optional) | Owner-controlled fund rules | Subscription (owner commits voluntarily) |
 
-Most contracts need locking to be trustless. Two protections work together:
+Most contracts need locking to be trustless — without it, the owner can bypass the rules and spend directly.
 
-1. **Locking** prevents the owner from spending funds directly or converting through unauthorized baskets
-2. **Parameter immutability** prevents the owner from changing the contract rules (splitter shares, escrow parties, etc.) — because locking does NOT prevent identity updates to the contentMultiMap
+Parameter protection (preventing changes to splitter shares, escrow terms, etc.) is handled by VerusID's existing access control — no special immutability check needed:
 
-Both are required. A locked splitter with mutable shares isn't trustless — the owner changes the shares, then waits for unlock. An unlocked splitter with immutable shares isn't trustless either — the owner just spends directly. Subscriptions are the exception: the owner voluntarily authorizes pulls from their own funds and can cancel anytime.
+- **Immutable params:** Lock identity + revocation authority set to cold key
+- **Changeable with consent:** Multisig — all parties must agree to update
+- **Admin-controlled:** Single owner retains update rights
+
+VerusID already has locking, multisig (`minSigs` + multiple primary addresses), revocation, and recovery. The contract system doesn't need to reinvent access control — the identity IS the access control layer. Subscriptions are the exception: the owner voluntarily authorizes pulls from their own funds and can cancel anytime.
 
 ### Why Two Layers
 
@@ -819,7 +822,7 @@ bool CheckContractActive(uint32_t height)
 | `pbaas/reserves.cpp` | Contract dispatch in `AddReserveTransferImportOutputs` | 150 |
 | `pbaas/pbaas.cpp` | Contract-aware check in `PrecheckReserveTransfer` | 60 |
 | `pbaas/pbaas.h` | Activation timestamp | 5 |
-| `pbaas/identity.cpp` | Contract validation at registration + spending restriction + param immutability | 120 |
+| `pbaas/identity.cpp` | Contract validation at registration + spending restriction | 80 |
 | `rpc/pbaasrpc.cpp` | New RPC commands (createcontract, getcontract, contractaction) | 200 |
 | **Total** | | **~2300** |
 
@@ -893,49 +896,16 @@ When the import processor needs to find the current state for a contract:
 
 State UTXOs form a chain — each state transition spends the previous state UTXO and creates a new one, exactly like notarizations.
 
-### 3.6 Contract Parameter Immutability
+### 3.6 Contract Parameter Protection
 
-Contract parameters (`vrsc::contract.params.*` and `vrsc::contract.type`) must be immutable after the identity is created. Otherwise, a contract owner could change splitter shares, escrow parties, or lending terms after users have deposited funds.
+Contract parameters (splitter shares, escrow terms, lending rates) are protected by VerusID's existing access control, not by a special immutability layer:
 
-**Solution: Reject identity updates that modify contract keys.**
+- **Locking** prevents direct spending of contract funds
+- **Multisig** prevents unilateral parameter changes (all parties must sign updates)
+- **Revocation** lets a trusted authority pause the contract
+- **Recovery** provides emergency override
 
-**File: `src/pbaas/identity.cpp`** — In `ValidateIdentityPrimary`, when an identity update is being validated:
-
-```cpp
-// If the existing identity is a contract, reject updates to contract keys
-if (CVerusContract::IsContract(existingIdentity))
-{
-    CIdentity newIdentity(tx, ...);
-
-    // Compare contract-relevant multimap entries
-    // vrsc::contract.type and vrsc::contract.params.* must be identical
-    uint160 typeKey = CVerusContract::ContractTypeKey();
-    auto oldType = existingIdentity.contentMultiMap.find(typeKey);
-    auto newType = newIdentity.contentMultiMap.find(typeKey);
-
-    if (oldType == existingIdentity.contentMultiMap.end() ||
-        newType == newIdentity.contentMultiMap.end() ||
-        oldType->second != newType->second)
-    {
-        return eval->Error("Cannot modify contract type after deployment");
-    }
-
-    // Check all vrsc::contract.params.* keys — none may be added, removed, or changed
-    // vrsc::contract.state.* keys are NOT checked here — they're updated by consensus
-    // (but state updates happen via state UTXOs, not identity updates)
-}
-```
-
-The identity owner CAN still:
-- Update non-contract multimap keys (profile, social, etc.)
-- Update primary addresses (change signing keys)
-- The revocation authority can revoke (pause the contract)
-- The recovery authority can recover (emergency override)
-
-The identity owner CANNOT:
-- Change `vrsc::contract.type`
-- Change any `vrsc::contract.params.*` key
-- Remove contract keys (would effectively delete the contract)
+No additional code is needed for parameter protection — the identity's `minSigs`, primary addresses, revocation authority, and recovery authority already provide the required access control. Contract deployers choose the security model that fits their use case.
 
 ---
 
