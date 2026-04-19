@@ -352,13 +352,29 @@ Buyer deposits
       → closing-split@ (splitter: seller 94%, agent 3%, taxes 3%)
 ```
 
-### Why This Is Better Than Ethereum's Model
+### How Chaining Could Work
 
-On Ethereum, a smart contract is a monolithic program — all logic in one contract, one exploit can drain everything. Here:
+The codebase already has the building blocks for multi-step routing. `CReserveTransfer` supports `HasNextLeg()` — a transfer can specify a `gatewayID` and `gatewayCode` on its destination, and the import processor routes it to the next system. There's even a `DEST_NESTEDTRANSFER` type defined for arbitrary chaining, though it's currently stubbed out (`"Nested currency transfers not yet supported"` — reserves.cpp line 3657).
+
+**Possible approaches:**
+
+1. **Implement `DEST_NESTEDTRANSFER`** — The placeholder already exists. A contract template's output could embed a nested reserve transfer targeting the next contract identity. The import processor would create it as an output, and the export → import cycle processes it next block.
+
+2. **Contract outputs as reserve transfers** — When a contract template creates an output to a VerusID that is itself a contract (has `vrsc::contract.type`), it automatically creates a reserve transfer instead of a direct UTXO. This uses the existing export → import pipeline — no new mechanism, just recognizing the destination.
+
+3. **Manual triggering** — Contract A outputs funds to contract B's address. Someone sends a `sendcurrency` action to contract B to trigger processing. Not automatic, requires an external actor, but simple and safe.
+
+4. **Use `gatewayCode` for routing** — The contract template sets `gatewayID = next_contract_identity` and `gatewayCode = action_to_invoke` on its output. The existing next-leg routing handles the rest. This is closest to how cross-chain routing already works.
+
+**The right approach needs dev input** — it depends on whether contract chaining should reuse the cross-chain routing mechanism (option 4), implement the already-planned nested transfers (option 1), or stay simple with manual triggering (option 3).
+
+### Security Advantage Over Ethereum
+
+Regardless of which chaining approach is chosen, the security model is fundamentally different from Ethereum:
 
 - **Each step is a separate identity** with its own multisig, revocation, and recovery
 - **If one step has a bug**, revoke that identity — the others keep running
-- **No reentrancy** — each step processes in a separate block
+- **No reentrancy** — each step processes in a separate block, never recursively in the same transaction
 - **Each identity is auditable independently** — simpler to verify one-purpose contracts
 - **Composability is additive** — adding a new step doesn't increase attack surface of existing steps
 
