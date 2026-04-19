@@ -1,19 +1,162 @@
 # Verus Deterministic Contract Standard (VCS)
-## Non-Turing-Complete Smart Contracts via VerusID Content Multimap
+## Policies and Contracts for VerusID via Content Multimap
 
 ### Overview
 
-A Verus Contract is a VerusID whose `contentMultiMap` declares a contract type and its parameters. The protocol interprets these declarations through the Verus Smart Transaction infrastructure — no virtual machine, no bytecode, no Turing completeness. Each contract type is a known template with a precheck validator and an import-time executor, following the same architecture as reserve transfers and basket conversions.
+This spec defines two layers of programmable behavior for VerusIDs, both implemented through VDXF keys in the `contentMultiMap` — no virtual machine, no bytecode, no Turing completeness:
+
+**Layer 1: Policies** — Restrictions on what a locked identity can do. Security-focused. Protects funds from key compromise by whitelisting allowed operations. Built on the existing capability where locked VerusIDs can stake (self-send).
+
+**Layer 2: Contracts** — Rules about how funds are managed. Functional. Works on any identity (locked or unlocked). Enables subscriptions, escrow, revenue splits, lending.
+
+| Layer | Identity State | Purpose | Example |
+|-------|---------------|---------|---------|
+| **Policy** | Locked | Restrict what the owner can do | Arb bot, market maker, treasury |
+| **Contract** | Locked (usually) | Define what happens to funds | Escrow, splitter, vesting, lending |
+| **Contract** | Unlocked (optional) | Owner-controlled fund rules | Subscription (owner commits voluntarily) |
+
+Most contracts need locking to be trustless. Two protections work together:
+
+1. **Locking** prevents the owner from spending funds directly or converting through unauthorized baskets
+2. **Parameter immutability** prevents the owner from changing the contract rules (splitter shares, escrow parties, etc.) — because locking does NOT prevent identity updates to the contentMultiMap
+
+Both are required. A locked splitter with mutable shares isn't trustless — the owner changes the shares, then waits for unlock. An unlocked splitter with immutable shares isn't trustless either — the owner just spends directly. Subscriptions are the exception: the owner voluntarily authorizes pulls from their own funds and can cancel anytime.
+
+### Why Two Layers
+
+A locked VerusID can already stake — the staking spend goes to itself and the balance grows. The protocol allows this in `serverchecker.cpp`:
+
+```cpp
+if (id.IsValidUnrevoked() &&
+    ((isStake && ...) ||     // staking: ALLOWED even when locked
+     sourceIsSelf ||          // internal operations
+     !id.IsLocked(spendHeight)))  // everything else: only if NOT locked
+```
+
+**Layer 1 (Policies)** extends this: a locked identity with a `vrsc::contract.policy.allowedbaskets` whitelist in its multimap can ALSO do self-sends (conversions), but ONLY through whitelisted baskets. Without a whitelist, locked = staking only (backward compatible). This is a security feature — it enables arb/DeFi from locked identities while preventing value extraction through malicious baskets.
+
+**Layer 2 (Contracts)** is independent: a VerusID with `vrsc::contract.type` in its multimap has rules about how incoming/outgoing funds are handled. These rules execute during `AddReserveTransferImportOutputs`. The identity can be locked or unlocked — a subscription doesn't need locking, but a lending pool does.
 
 ---
 
-## Part 1: Code Changes Required
+## Part 1: Policy Layer — Secure Self-Send for Locked Identities
 
-### 1.1 Architecture: VDXF-Based, Not Eval-Based
+### 1.0 The Attack Vector Policies Prevent
+
+Without a whitelist, allowing self-sends from locked identities creates a value extraction attack:
+
+1. Attacker compromises keys of a locked identity holding 10,000 VRSC
+2. Attacker creates `ScamBasket` — a basket full of worthless tokens they control
+3. Attacker converts 10,000 VRSC → ScamBasket tokens (returns to same address, self-send passes)
+4. Real VRSC flows into the basket's reserves, attacker withdraws it
+5. Locked identity now holds worthless ScamBasket tokens — value drained without funds "leaving"
+
+**The whitelist prevents this.** A locked identity with `allowedbaskets = [Bridge.vETH]` can only convert through Bridge.vETH. The attacker can't route through a scam basket. Worst case: attacker makes bad trades on Bridge.vETH, losing on spread — not losing principal.
+
+### 1.1 Policy VDXF Keys
+
+```
+vrsc::contract.policy.allowedbaskets    = [uint160]  // basket currency IDs allowed for conversions
+vrsc::contract.policy.allowedcurrencies = [uint160]  // currency IDs allowed in any operation
+```
+
+If no policy keys are present → locked identity can only stake (backward compatible).
+If policy keys are present → locked identity can also self-send through whitelisted operations.
+
+### 1.2 Code Change — serverchecker.cpp
+
+**File: `src/script/serverchecker.cpp`** — line ~168, extend the spending authorization:
+
+```cpp
+if (id.IsValidUnrevoked() &&
+    ((isStake && (!enforceIDStakeHeightLimit || (idHeight && (spendHeight - idHeight) >= VERUS_MIN_STAKEAGE))) ||
+     sourceIsSelf ||
+     (id.IsLocked(spendHeight) && isSelfSend && CheckPolicyWhitelist(id, tx, spendHeight)) ||  // NEW
+     !id.IsLocked(spendHeight)))
+{
+```
+
+Where `isSelfSend` checks that ALL outputs in the transaction go back to the same identity address, and `CheckPolicyWhitelist` validates:
+
+```cpp
+bool CheckPolicyWhitelist(const CIdentity &id, const CTransaction &tx, uint32_t height)
+{
+    // Read allowed baskets from contentMultiMap
+    uint160 basketPolicyKey = CVDXF::GetDataKey("vrsc::contract.policy.allowedbaskets", ...);
+    auto it = id.contentMultiMap.find(basketPolicyKey);
+    if (it == id.contentMultiMap.end())
+        return false;  // no policy = no self-sends (only staking)
+
+    std::set<uint160> allowedBaskets;
+    // deserialize the whitelist from multimap value
+    // ...
+
+    // Check every reserve transfer in the transaction
+    for (auto &vout : tx.vout)
+    {
+        COptCCParams p;
+        CReserveTransfer rt;
+        if (vout.scriptPubKey.IsPayToCryptoCondition(p) &&
+            p.evalCode == EVAL_RESERVE_TRANSFER &&
+            (rt = CReserveTransfer(p.vData[0])).IsValid())
+        {
+            // The via currency (basket) must be on the whitelist
+            uint160 importCurrency = rt.IsImportToSource() ? rt.FirstCurrency() : rt.destCurrencyID;
+            if (!allowedBaskets.count(importCurrency))
+                return false;
+
+            // If allowedcurrencies policy exists, check currency whitelist too
+            // ...
+        }
+    }
+    return true;
+}
+```
+
+### 1.3 Use Cases
+
+**Arb Bot:**
+```bash
+# Lock identity, set whitelist
+verus updateidentity '{"name":"my-arb-bot@", "flags": 1,
+  "contentmultimap": {
+    "vrsc::contract.policy.allowedbaskets": ["Bridge.vETH"],
+    "vrsc::contract.policy.allowedcurrencies": ["VRSC", "vETH", "DAI"]
+  }}'
+
+# Bot runs, converts VRSC↔vETH↔DAI through Bridge — all self-sends
+# Keys compromised? Attacker can only arb through Bridge.vETH
+# Recover identity, lock attacker out
+```
+
+**Treasury:**
+```bash
+# Organization funds locked, can only convert between stablecoins
+verus updateidentity '{"name":"treasury@", "flags": 1,
+  "contentmultimap": {
+    "vrsc::contract.policy.allowedbaskets": ["Bridge.vETH"],
+    "vrsc::contract.policy.allowedcurrencies": ["DAI", "USDC", "VRSC"]
+  }}'
+```
+
+**Market Maker:**
+```bash
+# Locked identity provides liquidity, restricted to specific basket
+verus updateidentity '{"name":"mm-bot@", "flags": 1,
+  "contentmultimap": {
+    "vrsc::contract.policy.allowedbaskets": ["Bridge.vETH", "Kaiju"]
+  }}'
+```
+
+---
+
+## Part 2: Contract Layer — Fund Management Rules
+
+### 2.0 Architecture: VDXF-Based, Not Eval-Based
 
 > **Important:** Contracts do NOT use a new eval code. Eval codes (`EVAL_RESERVE_TRANSFER`, `EVAL_IDENTITY_PRIMARY`, etc.) are deep protocol primitives — the wrong layer for contracts. Contracts are a higher-level concept built ON existing smart transaction types using VDXF keys.
 
-A contract identity is just a normal VerusID whose `contentMultiMap` contains a `vrsc::contract.type` VDXF key. Funds sent to it sit in normal identity outputs (`EVAL_IDENTITY_PRIMARY`). The existing smart transaction infrastructure (precheck, validation, import processing) is extended to recognize contract identities by their VDXF keys and dispatch to template-specific logic.
+A contract identity is a VerusID whose `contentMultiMap` contains a `vrsc::contract.type` VDXF key. Contract actions are submitted as reserve transfers with the action specified via `CTransferDestination.gatewayCode` (a uint160 field that already exists for "code for function to execute on the gateway"). The contract identity IS the gateway; the `gatewayCode` is the VDXF key of the action.
 
 **What this means for the code:**
 - No new entry in `src/cc/eval.h`
