@@ -262,6 +262,8 @@ vrsc::contract.lending.interestmodel   = {baseRate, slope1, slope2, kink}
 
 **Why basket prices work as oracle:** Verus basket currencies maintain `conversionPrice[]` in `CCoinbaseCurrencyState`, updated every block by actual reserve conversions. These prices are consensus-level, manipulation-resistant (moving them requires depositing/withdrawing real reserves — no flash loans on UTXO), always available, and already used for reserve-to-reserve swaps. No external oracle infrastructure needed.
 
+**Already proven:** The [Verus Oracle](https://github.com/Fried333/verus-oracle) on [scan.verus.cx](https://scan.verus.cx) uses this exact approach — reads `priceinreserve` from basket reserves (`CCoinbaseCurrencyState`), applies depth-weighted averaging across 29 active baskets, and prices 17 currencies with ~0.3% error vs market. No Chainlink, no external oracle nodes, no off-chain price feeds. The oracle worker just reads what the protocol already knows. The lending template would do the same thing but inside `AddReserveTransferImportOutputs` instead of in an off-chain service — same data source, protocol-level consumer instead of API-level.
+
 **Interest math:** Uses `cpp_dec_float_50` (same as existing `CalculateFractionalOut()`) for compound interest with large block gaps. Two-slope model: `rate = baseRate + utilization * slope1` below kink, steeper `slope2` above kink.
 
 ---
