@@ -288,7 +288,96 @@ These are proven today or achievable using existing primitives:
 
 ---
 
-## Part 5: Code Change Summary
+## Part 5: Composability — Chained Identities
+
+Each contract identity does one thing. Complex financial flows are built by chaining destinations — the output of contract A becomes the input of contract B, processed in the next import cycle. No recursive dispatch, no reentrancy risk. Same confirm-then-process model that reserve transfers already use.
+
+### Examples
+
+**Royalty Distribution:**
+```
+Sale revenue
+  → royalty-split@ (splitter: 70% artist, 20% label, 10% producer)
+    → artist-vest@ (vesting: monthly over 12 months)
+    → label-treasury@ (policy: locked, whitelisted baskets only)
+```
+
+**Company Payroll:**
+```
+Company revenue
+  → company-split@ (splitter: 60% operations, 30% payroll, 10% reserve)
+    → payroll-split@ (splitter: employee shares)
+      → employee1-vest@ (vesting: cliff + monthly)
+      → employee2-vest@ (vesting: cliff + monthly)
+```
+
+**Crowdfund → Milestone → Distribute:**
+```
+Contributors fund
+  → crowdfund@ (conditional: oracle attests "goal met" or timeout refund)
+    → project-escrow@ (escrow: milestone-based release)
+      → team-split@ (splitter: founder 40%, dev 35%, design 25%)
+```
+
+**Subscription → Revenue Share:**
+```
+Users subscribe
+  → service-sub@ (subscription: monthly pull)
+    → revenue-split@ (splitter: 40% founder, 30% dev, 30% marketing)
+      → dev-vest@ (vesting: 4-year schedule with 1-year cliff)
+```
+
+**Lending with Fee Distribution:**
+```
+Borrower gets liquidated
+  → lending-pool@ (lending: liquidation triggers)
+    → liquidation-split@ (splitter: 90% repay lenders, 5% liquidator, 5% protocol)
+      → protocol-treasury@ (policy: locked, whitelisted)
+```
+
+**Protected Market Making:**
+```
+mm-bot@ (policy: locked, whitelist = Bridge.vETH)
+  profits accumulate, periodically swept to
+    → profit-split@ (splitter: 80% LPs, 20% operator)
+```
+
+**Real Estate Closing:**
+```
+Buyer deposits
+  → property-escrow@ (escrow: awaiting title verification)
+    → title-oracle@ attests "clear title"
+      → closing-split@ (splitter: seller 94%, agent 3%, taxes 3%)
+```
+
+### Why This Is Better Than Ethereum's Model
+
+On Ethereum, a smart contract is a monolithic program — all logic in one contract, one exploit can drain everything. Here:
+
+- **Each step is a separate identity** with its own multisig, revocation, and recovery
+- **If one step has a bug**, revoke that identity — the others keep running
+- **No reentrancy** — each step processes in a separate block
+- **Each identity is auditable independently** — simpler to verify one-purpose contracts
+- **Composability is additive** — adding a new step doesn't increase attack surface of existing steps
+
+A single identity can also combine policy + contract keys on the same contentMultiMap (e.g., a locked lending pool with a basket whitelist). But for multi-step flows, chaining separate identities is cleaner and more secure.
+
+---
+
+## Part 6: What's Left Out (By Design)
+
+| What | Why It's Excluded |
+|---|---|
+| **Contract-to-contract calls** | Reentrancy attacks. Chained identities achieve composability safely via sequential block processing. |
+| **Flash loans** | Account-model trick, impossible on UTXO. The mechanism that enables most DeFi exploits. |
+| **Arbitrary computation** | Turing completeness creates unbounded attack surface. Templates are auditable, bounded, and predictable. |
+| **Novel unanticipated primitives** | Requires adding a new template handler. Trade-off: can't deploy arbitrary logic, but every deployed template is protocol-verified. |
+
+These are the categories responsible for the majority of smart contract exploits. Their absence is the security model, not a limitation.
+
+---
+
+## Part 7: Code Change Summary
 
 | File | Change | Lines (est.) |
 |---|---|---|
@@ -307,7 +396,7 @@ No changes to `cc/eval.h`, `cc/CCcustom.cpp`, or `cc/CCaddresses.cpp`. Everythin
 
 ---
 
-## Part 6: Rollout
+## Part 8: Rollout
 
 ### Phase 1: Policy Whitelist
 - Smallest change (~50 lines in serverchecker.cpp)
