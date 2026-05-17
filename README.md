@@ -1,6 +1,44 @@
 # Verus Deterministic Contract Standard (VCS)
 ## Extending VerusID Content Multimap from Passive to Active
 
+> **Status:** Design proposal / spec document. **No implementation in this repo yet** — this is the case for adding deterministic contract templates to the Verus protocol by extending two existing core functions to read contentMultiMap. Code-change estimate at the bottom (~2,300 lines split across existing source files + two new ones). Reviewed by the Verus dev; awaiting upstream prioritization.
+
+## Table of contents
+
+- [What this is](#what-this-is)
+- [What this is NOT](#what-this-is-not)
+- [The Idea](#the-idea)
+- [What Verus Already Provides](#what-verus-already-provides)
+- [Why Pre-Signing Isn't Enough](#why-pre-signing-isnt-enough)
+- [Part 1: Policy Layer — `serverchecker.cpp`](#part-1-policy-layer--serverchecker.cpp)
+- [Part 2: Contract Layer — `AddReserveTransferImportOutputs`](#part-2-contract-layer--addreservetransferimportoutputs)
+- [Part 3: Templates](#part-3-templates)
+  - [3.1 Splitter](#31-splitter)
+  - [3.2 Escrow](#32-escrow)
+  - [3.3 Vesting](#33-vesting)
+  - [3.4 Subscription](#34-subscription)
+  - [3.5 Conditional (Oracle-Triggered)](#35-conditional-oracle-triggered)
+  - [3.6 Lending Pool](#36-lending-pool)
+- [Part 4: What Already Works Without Protocol Changes](#part-4-what-already-works-without-protocol-changes)
+- [Part 5: Composability — Chained Identities](#part-5-composability--chained-identities)
+- [Part 6: What's Left Out (By Design)](#part-6-whats-left-out-by-design)
+- [Part 7: Code Change Summary](#part-7-code-change-summary)
+- [Part 8: Rollout](#part-8-rollout)
+- [License](#license)
+- [Disclaimer](#disclaimer)
+
+## What this is
+
+A protocol-change proposal: extend VerusID's existing `contentMultiMap` from passive storage to **active, protocol-readable behaviour**. Two existing core functions become contentMultiMap-aware — `serverchecker.cpp` for spending policy whitelists, and `AddReserveTransferImportOutputs` for contract template dispatch (splitter, escrow, vesting, subscription, conditional, lending pool).
+
+The result: deterministic, auditable, bounded-attack-surface "contracts" without a virtual machine, without bytecode, without reentrancy, without flash loans.
+
+## What this is NOT
+
+- **Not a runnable codebase.** This repo contains the design + rationale only. The corresponding C++ changes would land in [VerusCoin/VerusCoin](https://github.com/VerusCoin/VerusCoin) if/when the proposal is adopted.
+- **Not Ethereum-style smart contracts.** No Turing-completeness, no arbitrary bytecode execution, no contract-to-contract calls. Templates are a fixed set of audited primitives that compose by chaining identities across blocks.
+- **Not a replacement for [Make Protocol](https://github.com/Fried333/make-protocol).** Make Protocol works *today* on unmodified Verus via pre-signed SIGHASH_SINGLE|ANYONECANPAY transactions. VCS would make some Make Protocol patterns simpler (no off-chain broadcaster, variable amounts, on-chain liquidation), but the two address different use cases.
+
 ### The Idea
 
 VerusID's `contentMultiMap` already stores arbitrary VDXF key-value data on every identity. Right now it's **passive** — off-chain systems read it and act on it (subscription terms, profile data, credentials). The extension is making the protocol itself **read and act on specific VDXF keys** during transaction processing.
@@ -437,3 +475,22 @@ No changes to `cc/eval.h`, `cc/CCcustom.cpp`, or `cc/CCaddresses.cpp`. Everythin
 - Uses basket conversion prices as oracle
 - ~600 lines additional
 - Heavy testnet validation required
+
+---
+
+## License
+
+MIT — see [LICENSE](./LICENSE) if present, or the standard MIT terms.
+
+## Disclaimer
+
+This document is a **design proposal** provided **"AS IS"**, without warranty of any kind, express or implied. No implementation in this repository is fit for any purpose; the C++ source-level changes described in [Part 7](#part-7-code-change-summary) have not been written, reviewed, audited, or merged into VerusCoin/VerusCoin. In no event shall the authors or copyright holders be liable for any claim, damages, or other liability arising from reliance on this document.
+
+If and when these proposals land in the Verus protocol, any deployment of the resulting contract templates (escrow, vesting, lending pool, etc.) for real funds should be preceded by:
+
+- Independent code review of the corresponding C++ changes
+- A multi-month testnet observation period
+- Audit of the specific template's economic assumptions (lending: liquidation parameters; vesting: schedule math; escrow: dispute resolution)
+- A revoke/recovery authority on every deployed contract identity — the [Make Protocol revoke/recovery feedback](https://github.com/Fried333/make-protocol) applies double here
+
+The protocol changes deliberately exclude the categories responsible for the majority of smart-contract exploits (contract-to-contract calls, flash loans, arbitrary computation — see [Part 6](#part-6-whats-left-out-by-design)). That exclusion is the security model, not an oversight.
